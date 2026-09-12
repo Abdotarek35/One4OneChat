@@ -1,0 +1,13 @@
+{
+  "name": "one4one-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal proof-of-concept: matched WebRTC video + relayed text chat between two strangers.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
