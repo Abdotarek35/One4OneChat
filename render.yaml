@@ -10,5 +10,11 @@ services:
         sync: false
       - key: CF_TURN_KEY_API_TOKEN
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
         sync: false

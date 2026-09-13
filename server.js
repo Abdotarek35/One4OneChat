@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 const { randomUUID } = require('crypto');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,7 +11,90 @@ const io = new Server(server);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Hands the client a fresh set of STUN/TURN servers.
+// --- Storage backend ---------------------------------------------------
+// If Upstash credentials are set, all queue/session/report state lives in
+// Redis, so it survives server restarts and is ready for multiple server
+// instances later. If not configured, we fall back to the original
+// in-memory arrays/Maps so the app still runs for local testing.
+const redis =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? Redis.fromEnv()
+    : null;
+const useRedis = !!redis;
+
+if (!useRedis) {
+  console.warn(
+    'UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set — using in-memory ' +
+    'state. Queues, sessions, and reports will reset on every restart.'
+  );
+}
+
+const MODES = ['text', 'video', 'voice'];
+const SESSION_TTL_SECONDS = 3600; // safety net so a crashed socket doesn't leak forever
+
+// In-memory fallback storage (only used when Redis isn't configured)
+const memQueues = { text: [], video: [], voice: [] };
+const memSessions = new Map();
+const memModes = new Map();
+const memReports = [];
+
+async function queuePush(mode, socketId) {
+  if (useRedis) return redis.rpush(`queue:${mode}`, socketId);
+  memQueues[mode].push(socketId);
+}
+
+async function queuePop(mode) {
+  if (useRedis) return redis.lpop(`queue:${mode}`);
+  return memQueues[mode].shift() || null;
+}
+
+async function queueRemove(mode, socketId) {
+  if (useRedis) return redis.lrem(`queue:${mode}`, 0, socketId);
+  memQueues[mode] = memQueues[mode].filter((id) => id !== socketId);
+}
+
+async function sessionSet(socketId, data) {
+  if (useRedis) {
+    return redis.set(`session:${socketId}`, JSON.stringify(data), { ex: SESSION_TTL_SECONDS });
+  }
+  memSessions.set(socketId, data);
+}
+
+async function sessionGet(socketId) {
+  if (useRedis) {
+    const raw = await redis.get(`session:${socketId}`);
+    if (!raw) return null;
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  }
+  return memSessions.get(socketId) || null;
+}
+
+async function sessionDelete(socketId) {
+  if (useRedis) return redis.del(`session:${socketId}`);
+  memSessions.delete(socketId);
+}
+
+async function modeSet(socketId, mode) {
+  if (useRedis) return redis.set(`mode:${socketId}`, mode, { ex: SESSION_TTL_SECONDS });
+  memModes.set(socketId, mode);
+}
+
+async function modeGet(socketId) {
+  if (useRedis) return (await redis.get(`mode:${socketId}`)) || 'video';
+  return memModes.get(socketId) || 'video';
+}
+
+async function modeDelete(socketId) {
+  if (useRedis) return redis.del(`mode:${socketId}`);
+  memModes.delete(socketId);
+}
+
+async function reportPush(report) {
+  if (useRedis) return redis.rpush('reports', JSON.stringify(report));
+  memReports.push(report);
+}
+
+// --- Hands the client a fresh set of STUN/TURN servers ------------------
 // The Cloudflare TURN secret NEVER leaves this server.
 app.get('/turn-credentials', async (req, res) => {
   const keyId = process.env.CF_TURN_KEY_ID;
@@ -18,8 +102,6 @@ app.get('/turn-credentials', async (req, res) => {
   const fallback = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
   if (!keyId || !apiToken) {
-    // Cloudflare not configured yet — fall back to STUN-only so the app
-    // still works, just without a relay for hard networks.
     return res.json(fallback);
   }
 
@@ -32,7 +114,7 @@ app.get('/turn-credentials', async (req, res) => {
           Authorization: `Bearer ${apiToken}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ ttl: 86400 }), // credential valid for 24h
+        body: JSON.stringify({ ttl: 86400 }),
       }
     );
 
@@ -45,29 +127,24 @@ app.get('/turn-credentials', async (req, res) => {
   }
 });
 
-// --- In-memory state (PoC only — replace with Redis before real scale) ---
-const MODES = ['text', 'video', 'voice'];
-const waitingQueues = { text: [], video: [], voice: [] };  // one queue per mode
-const activeRooms = new Map();                              // socketId -> { roomId, partnerId, mode }
-const socketModes = new Map();                               // socketId -> last requested mode
-
-function tryMatch(socket, mode) {
+// --- Matching engine ------------------------------------------------------
+async function tryMatch(socket, mode) {
   const validMode = MODES.includes(mode) ? mode : 'video';
-  socketModes.set(socket.id, validMode);
+  await modeSet(socket.id, validMode);
 
   // Make sure this socket isn't already queued in any mode
-  MODES.forEach((m) => {
-    waitingQueues[m] = waitingQueues[m].filter((id) => id !== socket.id);
-  });
+  for (const m of MODES) {
+    await queueRemove(m, socket.id);
+  }
 
-  const queue = waitingQueues[validMode];
+  const partnerId = await queuePop(validMode);
 
-  if (queue.length > 0) {
-    const partnerId = queue.shift();
+  if (partnerId) {
     const partnerSocket = io.sockets.sockets.get(partnerId);
 
     if (!partnerSocket || !partnerSocket.connected) {
-      // Partner disconnected while waiting — try the next one
+      // Partner disconnected while waiting (or is on another server
+      // instance we can't reach directly) — try the next one
       return tryMatch(socket, validMode);
     }
 
@@ -75,43 +152,84 @@ function tryMatch(socket, mode) {
     socket.join(roomId);
     partnerSocket.join(roomId);
 
-    activeRooms.set(socket.id, { roomId, partnerId: partnerSocket.id, mode: validMode });
-    activeRooms.set(partnerSocket.id, { roomId, partnerId: socket.id, mode: validMode });
+    await sessionSet(socket.id, { roomId, partnerId: partnerSocket.id, mode: validMode });
+    await sessionSet(partnerSocket.id, { roomId, partnerId: socket.id, mode: validMode });
 
-    // One side has to be the WebRTC "offerer" — arbitrarily pick the one
-    // who was already waiting.
     socket.emit('matched', { roomId, initiator: true, mode: validMode });
     partnerSocket.emit('matched', { roomId, initiator: false, mode: validMode });
   } else {
-    queue.push(socket.id);
+    await queuePush(validMode, socket.id);
     socket.emit('waiting');
   }
 }
 
-function leaveRoom(socket, notifyPartner = true) {
-  const info = activeRooms.get(socket.id);
+async function leaveRoom(socket, notifyPartner = true) {
+  const info = await sessionGet(socket.id);
   if (info) {
-    activeRooms.delete(socket.id);
-    activeRooms.delete(info.partnerId);
+    await sessionDelete(socket.id);
+    await sessionDelete(info.partnerId);
     socket.leave(info.roomId);
     if (notifyPartner) {
       io.to(info.partnerId).emit('partner-left');
     }
   }
-  MODES.forEach((m) => {
-    waitingQueues[m] = waitingQueues[m].filter((id) => id !== socket.id);
-  });
+  for (const m of MODES) {
+    await queueRemove(m, socket.id);
+  }
 }
 
-const reports = []; // PoC only — becomes a real `reports` table once the DB is wired in
-
-// Checks text against OpenAI's free Moderation endpoint. If no API key is
-// set, messages are allowed through unmoderated so the PoC still runs —
-// but that means it is NOT safe to point real strangers at yet.
+// --- Moderation -------------------------------------------------------
+// Tries Gemini first (Google AI Studio — free, no credit card required),
+// then falls back to OpenAI's Moderation endpoint if that's configured
+// instead. If neither key is set, messages are allowed through
+// unmoderated so the PoC still runs — but that means it is NOT safe to
+// point real strangers at yet.
 async function moderateText(text) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return { flagged: false };
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
 
+  if (geminiKey) return moderateWithGemini(text, geminiKey);
+  if (openaiKey) return moderateWithOpenAI(text, openaiKey);
+  return { flagged: false };
+}
+
+async function moderateWithGemini(text, apiKey) {
+  const prompt =
+    'You are a content moderation classifier for a random stranger-chat app. ' +
+    'Reply with ONLY raw JSON and nothing else: {"flagged": true} or {"flagged": false}. ' +
+    'Flag sexual content involving minors, explicit sexual content, hate speech, ' +
+    'harassment, threats of violence, or attempts to solicit contact info from a minor. ' +
+    'Do NOT flag mild profanity or ordinary conversation.\n\n' +
+    `Message to classify: ${JSON.stringify(text)}`;
+
+  try {
+    const res = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'x-goog-api-key': apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 20 },
+        }),
+      }
+    );
+    if (!res.ok) throw new Error(`Gemini returned ${res.status}`);
+    const data = await res.json();
+    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+    return { flagged: !!parsed.flagged };
+  } catch (err) {
+    console.error('Gemini moderation check failed, allowing message through:', err.message);
+    return { flagged: false };
+  }
+}
+
+async function moderateWithOpenAI(text, apiKey) {
   try {
     const res = await fetch('https://api.openai.com/v1/moderations', {
       method: 'POST',
@@ -131,21 +249,22 @@ async function moderateText(text) {
   }
 }
 
+// --- Socket handlers -----------------------------------------------------
 io.on('connection', (socket) => {
   console.log('connected:', socket.id);
 
   socket.on('find-match', (mode) => tryMatch(socket, mode));
 
-  socket.on('skip', () => {
-    const lastMode = socketModes.get(socket.id) || 'video';
-    leaveRoom(socket);
+  socket.on('skip', async () => {
+    const lastMode = await modeGet(socket.id);
+    await leaveRoom(socket);
     tryMatch(socket, lastMode);
   });
 
   // Relay WebRTC offer/answer/ICE candidates to the partner only.
   // The server never looks at this payload's content.
-  socket.on('signal', (data) => {
-    const info = activeRooms.get(socket.id);
+  socket.on('signal', async (data) => {
+    const info = await sessionGet(socket.id);
     if (info) {
       io.to(info.partnerId).emit('signal', data);
     }
@@ -154,7 +273,7 @@ io.on('connection', (socket) => {
   // Text chat is relayed through the server on purpose (not P2P),
   // so it can be moderated — this is where that actually happens now.
   socket.on('chat-message', async (text) => {
-    const info = activeRooms.get(socket.id);
+    const info = await sessionGet(socket.id);
     if (!info || typeof text !== 'string' || !text.trim()) return;
 
     const clean = text.slice(0, 500);
@@ -168,25 +287,25 @@ io.on('connection', (socket) => {
     io.to(info.partnerId).emit('chat-message', clean);
   });
 
-  socket.on('report', (reason) => {
-    const lastMode = socketModes.get(socket.id) || 'video';
-    const info = activeRooms.get(socket.id);
+  socket.on('report', async (reason) => {
+    const lastMode = await modeGet(socket.id);
+    const info = await sessionGet(socket.id);
     if (info) {
-      reports.push({
+      await reportPush({
         reportedSocketId: info.partnerId,
         reporterSocketId: socket.id,
         reason: typeof reason === 'string' ? reason.slice(0, 100) : 'unspecified',
         at: new Date().toISOString(),
       });
-      console.log('REPORT:', reports[reports.length - 1]);
+      console.log('REPORT logged for', info.partnerId);
     }
-    leaveRoom(socket);
+    await leaveRoom(socket);
     tryMatch(socket, lastMode);
   });
 
-  socket.on('disconnect', () => {
-    leaveRoom(socket);
-    socketModes.delete(socket.id);
+  socket.on('disconnect', async () => {
+    await leaveRoom(socket);
+    await modeDelete(socket.id);
     console.log('disconnected:', socket.id);
   });
 });
@@ -194,4 +313,5 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`One4One PoC running on http://localhost:${PORT}`);
+  console.log(`Storage backend: ${useRedis ? 'Upstash Redis' : 'in-memory (not persistent)'}`);
 });
